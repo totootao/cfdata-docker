@@ -24,6 +24,8 @@ type regionTask struct {
 	Cron       string   `json:"cron"`
 	TopN       int      `json:"top_n"`
 	SpeedMin   string   `json:"speed_min"`
+	Source     string   `json:"source"` // 数据源: official（官方IP段）/ nsb（非标IP库）/ all（合并）
+	NsbURL     string   `json:"nsb_url,omitempty"` // 非标 IP 库 URL（留空用容器全局配置）
 	Enabled    bool     `json:"enabled"`
 	LastRun    string   `json:"last_run"`
 	LastStatus string   `json:"last_status"`
@@ -130,6 +132,7 @@ func (s *server) loadRegions() {
 		if t.SpeedMin == "" {
 			t.SpeedMin = "1"
 		}
+		t.Source = normalizeSource(t.Source)
 		s.regions[t.Region] = t
 		if t.Enabled {
 			if expr, err := parseCron(t.Cron); err == nil {
@@ -140,6 +143,18 @@ func (s *server) loadRegions() {
 		}
 	}
 	log.Printf("已加载 %d 个地区任务", len(s.regions))
+}
+
+// normalizeSource 数据源归一化：空/all/official/nsb
+func normalizeSource(src string) string {
+	switch strings.ToLower(strings.TrimSpace(src)) {
+	case "nsb":
+		return "nsb"
+	case "official":
+		return "official"
+	default:
+		return "all"
+	}
 }
 
 // saveRegionsLocked 持久化任务列表（调用方需持有 regionMu）
@@ -176,11 +191,30 @@ func (s *server) regionColos(region string) []string {
 	return nil
 }
 
-// collectRows 汇总多个机房的扫描结果
-func (s *server) collectRows(colos []string) []resultRow {
+// collectRows 汇总多个机房的扫描结果。source 决定读取目录：
+// official → results/{colo}.csv；nsb → results/nsb/{colo}.csv；all → 两者合并（按 ip:port 去重）
+func (s *server) collectRows(colos []string, source string) []resultRow {
+	var subdirs []string
+	switch normalizeSource(source) {
+	case "official":
+		subdirs = []string{""}
+	case "nsb":
+		subdirs = []string{"nsb"}
+	default:
+		subdirs = []string{"", "nsb"}
+	}
 	var rows []resultRow
-	for _, colo := range colos {
-		rows = append(rows, parseCSV(filepath.Join(s.resultsDir, strings.ToLower(colo)+".csv"))...)
+	seen := map[string]bool{}
+	for _, sub := range subdirs {
+		for _, colo := range colos {
+			for _, r := range parseCSV(filepath.Join(s.resultsDir, sub, strings.ToLower(colo)+".csv")) {
+				if seen[r.IPPort] {
+					continue
+				}
+				seen[r.IPPort] = true
+				rows = append(rows, r)
+			}
+		}
 	}
 	return rows
 }
@@ -216,6 +250,21 @@ func (s *server) fireDueRegions() {
 	}
 }
 
+// regionScanPlan 根据 source 决定要跑的扫描段：
+// official → 一次官方段；nsb → 一次非标段；all → 官方段跑完自动链式非标段
+func (s *server) regionScanPlan(t *regionTask) (first scanOptions, firstTrigger string, chainNsb bool) {
+	dcList := strings.Join(t.Colos, ",")
+	base := scanOptions{DCList: dcList, TopN: t.TopN, SpeedMin: t.SpeedMin}
+	switch normalizeSource(t.Source) {
+	case "nsb":
+		return scanOptions{TopN: t.TopN, SpeedMin: t.SpeedMin, Mode: "nsb", NsbURL: t.NsbURL}, "region-nsb:" + t.Region, false
+	case "official":
+		return base, "region:" + t.Region, false
+	default: // all：先官方后非标
+		return base, "region:" + t.Region, true
+	}
+}
+
 func (s *server) fireRegion(region string) {
 	s.regionMu.Lock()
 	t, ok := s.regions[region]
@@ -223,12 +272,14 @@ func (s *server) fireRegion(region string) {
 		s.regionMu.Unlock()
 		return
 	}
+	opt, trigger, _ := s.regionScanPlan(t)
+	src := normalizeSource(t.Source)
+	cron := t.Cron
 	dcList := strings.Join(t.Colos, ",")
-	topN, speedMin, cron := t.TopN, t.SpeedMin, t.Cron
 	s.regionMu.Unlock()
 
 	// busy 时返回错误：nextRun 保持过期状态，下一轮继续重试（相当于排队）
-	if err := s.runScanAsync(dcList, topN, speedMin, "region:"+region); err != nil {
+	if err := s.runScanAsync(opt, trigger); err != nil {
 		return
 	}
 
@@ -243,15 +294,46 @@ func (s *server) fireRegion(region string) {
 		s.saveRegionsLocked()
 	}
 	s.regionMu.Unlock()
-	log.Printf("地区任务 %s 已触发（机房: %s）", region, dcList)
+	log.Printf("地区任务 %s 已触发（机房: %s，数据源: %s）", region, dcList, src)
 }
 
-// onScanDone 扫描结束后更新地区任务的运行记录（由 runScanAsync 的完成回调调用）
-func (s *server) onScanDone(trigger string, runErr error) {
-	if !strings.HasPrefix(trigger, "region:") {
-		return
+// onScanDone 扫描结束后：all 任务链式触发非标段 + 更新地区任务的运行记录
+func (s *server) onScanDone(trigger string, opt scanOptions, runErr error) {
+	switch {
+	case strings.HasPrefix(trigger, "region:"): // 地区任务的官方段（或 official/nsb 单段任务的第一段）
+		region := strings.TrimPrefix(trigger, "region:")
+		s.regionMu.Lock()
+		t, ok := s.regions[region]
+		chain := ok && normalizeSource(t.Source) == "all"
+		nsbURL := ""
+		if ok {
+			nsbURL = t.NsbURL
+		}
+		s.regionMu.Unlock()
+		if chain {
+			// all：官方段结束，接着跑非标段（结果合并输出）
+			go func() {
+				// 链式段启动失败（如刚好有别的任务抢跑）只记日志，不覆盖官方段的成功状态
+				if err := s.runScanAsync(scanOptions{TopN: opt.TopN, SpeedMin: opt.SpeedMin, Mode: "nsb", NsbURL: nsbURL}, "region-nsb:"+region); err != nil {
+					log.Printf("地区任务 %s 的非标段触发失败: %v", region, err)
+				}
+			}()
+			return
+		}
+		s.markRegionDone(region, runErr)
+	case strings.HasPrefix(trigger, "region-nsb:"): // 地区任务的非标段（nsb 单段或 all 第二段）
+		s.markRegionDone(strings.TrimPrefix(trigger, "region-nsb:"), runErr)
+	case strings.HasPrefix(trigger, "web:all"): // Web 主扫描选了"全部"：官方段结束，链式非标段
+		go func() {
+			if err := s.runScanAsync(scanOptions{TopN: opt.TopN, SpeedMin: opt.SpeedMin, Mode: "nsb", NsbURL: opt.NsbURL}, "web-nsb"); err != nil {
+				log.Printf("Web 主扫描的非标段触发失败: %v", err)
+			}
+		}()
 	}
-	region := strings.TrimPrefix(trigger, "region:")
+}
+
+// markRegionDone 更新地区任务的 last_run/last_status
+func (s *server) markRegionDone(region string, runErr error) {
 	s.regionMu.Lock()
 	defer s.regionMu.Unlock()
 	t, ok := s.regions[region]
@@ -277,8 +359,8 @@ func (s *server) handleRegionsList(w http.ResponseWriter, r *http.Request) {
 	for _, t := range s.regions {
 		out = append(out, regionStatus{
 			regionTask:  *t,
-			ResultCount: len(s.collectRows(t.Colos)),
-			Running:     running && trigger == "region:"+t.Region,
+			ResultCount: len(s.collectRows(t.Colos, t.Source)),
+			Running:     running && (trigger == "region:"+t.Region || trigger == "region-nsb:"+t.Region),
 		})
 	}
 	s.regionMu.Unlock()
@@ -344,6 +426,12 @@ func (s *server) handleRegionSave(w http.ResponseWriter, r *http.Request) {
 	if req.Name == "" {
 		req.Name = req.Region
 	}
+	req.Source = normalizeSource(req.Source)
+	req.NsbURL = strings.TrimSpace(req.NsbURL)
+	if req.Source == "nsb" && req.NsbURL == "" && os.Getenv("NSB_SOURCE_URL") == "" {
+		httpError(w, http.StatusBadRequest, "非标数据源需要提供 nsb_url 或容器环境变量 NSB_SOURCE_URL")
+		return
+	}
 
 	s.regionMu.Lock()
 	t, ok := s.regions[req.Region]
@@ -353,6 +441,7 @@ func (s *server) handleRegionSave(w http.ResponseWriter, r *http.Request) {
 	}
 	t.Region, t.Name, t.Colos = req.Region, req.Name, colos
 	t.Cron, t.TopN, t.SpeedMin, t.Enabled = req.Cron, topN, speedMin, req.Enabled
+	t.Source, t.NsbURL = req.Source, req.NsbURL
 	if t.Enabled {
 		if expr, err := parseCron(t.Cron); err == nil {
 			nr := expr.Next(time.Now())
@@ -399,15 +488,24 @@ func (s *server) handleRegionScan(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusNotFound, "地区任务不存在")
 		return
 	}
-	dcList := strings.Join(t.Colos, ",")
-	topN, speedMin := t.TopN, t.SpeedMin
+	opt, trigger, _ := s.regionScanPlan(t)
 	s.regionMu.Unlock()
 
-	if err := s.runScanAsync(dcList, topN, speedMin, "region:"+region); err != nil {
+	if err := s.runScanAsync(opt, trigger); err != nil {
 		httpError(w, http.StatusConflict, "已有扫描任务进行中，请稍候")
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "started", "region": region})
+}
+
+// regionSource 地区的数据源：有任务配置用任务的，否则默认合并（all）
+func (s *server) regionSource(region string) string {
+	s.regionMu.Lock()
+	defer s.regionMu.Unlock()
+	if t, ok := s.regions[strings.ToUpper(region)]; ok {
+		return normalizeSource(t.Source)
+	}
+	return "all"
 }
 
 // GET /random-region/{region}/{n}.txt 随机返回 n 个 IP（bestcf 风格）
@@ -425,12 +523,13 @@ func (s *server) handleRandomRegion(w http.ResponseWriter, r *http.Request) {
 	if n > 500 {
 		n = 500
 	}
-	colos := s.regionColos(r.PathValue("region"))
+	region := r.PathValue("region")
+	colos := s.regionColos(region)
 	if len(colos) == 0 {
 		httpError(w, http.StatusNotFound, "未知地区（无任务配置，也无国家预设）")
 		return
 	}
-	rows := s.collectRows(colos)
+	rows := s.collectRows(colos, s.regionSource(region))
 	if len(rows) == 0 {
 		httpError(w, http.StatusNotFound, "该地区暂无扫描数据，请先触发对应机房的扫描")
 		return
@@ -454,7 +553,7 @@ func (s *server) handleRegionTop(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusNotFound, "未知地区（无任务配置，也无国家预设）")
 		return
 	}
-	rows := s.collectRows(colos)
+	rows := s.collectRows(colos, s.regionSource(region))
 	if len(rows) == 0 {
 		httpError(w, http.StatusNotFound, "该地区暂无扫描数据，请先触发对应机房的扫描")
 		return

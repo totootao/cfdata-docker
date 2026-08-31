@@ -134,6 +134,20 @@
     <div>
       <div class="card">
         <h2>选择数据中心并测速</h2>
+        <div class="row" style="margin-bottom:10px">
+          <div class="field" style="max-width:200px">
+            <label>数据源</label>
+            <select id="scanSource" onchange="onSourceChange()">
+              <option value="official">官方 IP 段</option>
+              <option value="nsb">非标 IP 库</option>
+              <option value="all">官方 + 非标</option>
+            </select>
+          </div>
+          <div class="field" id="nsbUrlField" style="display:none">
+            <label>非标 IP 库 URL（每行 "IP 端口"，可留空用容器配置）</label>
+            <input id="nsbUrl" placeholder="https://example.com/ips.txt">
+          </div>
+        </div>
         <div class="locs" id="locs"></div>
         <div class="row">
           <div class="field">
@@ -150,6 +164,9 @@
             <label>测速下限（MB/s）</label>
             <input id="speedMin" type="number" min="0" step="0.5" value="1">
           </div>
+        </div>
+        <div class="hint" id="nsbHint" style="display:none;margin-bottom:10px">
+          非标模式扫描给定 IP 库的全部地址，结果按落地机房自动分组；机房选择仅用于官方段。
         </div>
         <button class="btn" id="startBtn" onclick="startScan()">开始测速</button>
       </div>
@@ -174,6 +191,20 @@
             <div class="field">
               <label>机房列表（IATA 码，逗号分隔，选国家自动填充）</label>
               <input id="rColos" placeholder="例如 LHR,MAN">
+            </div>
+          </div>
+          <div class="row">
+            <div class="field" style="max-width:140px">
+              <label>数据源</label>
+              <select id="rSource" onchange="onRegionSourceChange()">
+                <option value="official">官方 IP 段</option>
+                <option value="nsb">非标 IP 库</option>
+                <option value="all">官方 + 非标</option>
+              </select>
+            </div>
+            <div class="field" id="rNsbUrlField" style="display:none">
+              <label>非标 IP 库 URL（留空用容器配置）</label>
+              <input id="rNsbUrl" placeholder="https://example.com/ips.txt">
             </div>
           </div>
           <div class="row">
@@ -290,18 +321,31 @@ function getDCList() {
   return [...set];
 }
 
+function onSourceChange() {
+  const v = $('scanSource').value;
+  $('nsbUrlField').style.display = v === 'official' ? 'none' : '';
+  $('nsbHint').style.display = v === 'official' ? 'none' : '';
+}
+
 async function startScan() {
+  const source = $('scanSource').value;
   const dcs = getDCList();
-  if (!dcs.length) { toast('请至少选择一个数据中心', true); return; }
+  if (!dcs.length && source !== 'nsb') { toast('请至少选择一个数据中心', true); return; }
   try {
     const r = await fetch('/api/scan', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ dc_list: dcs.join(','), top_n: parseInt($('topN').value) || 10, speed_min: $('speedMin').value })
+      body: JSON.stringify({
+        dc_list: dcs.join(','),
+        top_n: parseInt($('topN').value) || 10,
+        speed_min: $('speedMin').value,
+        source,
+        nsb_url: $('nsbUrl').value.trim()
+      })
     });
     if (r.status === 409) { toast('已有任务在运行，请稍候', true); poll(); return; }
     if (!r.ok) { const e = await r.json(); toast(e.error || '触发失败', true); return; }
-    toast('已开始测速: ' + dcs.join(', '));
+    toast(source === 'official' ? '已开始测速: ' + dcs.join(', ') : '已开始扫描（' + (source === 'nsb' ? '非标' : '官方+非标') + '）');
     poll();
   } catch (e) { toast('网络错误', true); }
 }
@@ -369,6 +413,7 @@ async function loadResults() {
         <div class="dc-block">
           <div class="dc-head">
             <span class="dc">${d.dc}</span>
+            ${d.source === 'nsb' ? '<span class="rt-tag" style="margin-left:6px">非标</span>' : ''}
             <span class="cnt">${d.count} 条</span>
             <span class="mt">${d.mod_time}</span>
           </div>
@@ -416,6 +461,12 @@ async function loadRegions() {
   } catch (e) { $('regionList').innerHTML = '<div class="empty">加载失败</div>'; }
 }
 
+function onRegionSourceChange() {
+  $('rNsbUrlField').style.display = $('rSource').value === 'official' ? 'none' : '';
+}
+
+const sourceLabel = { official: '官方', nsb: '非标', all: '官方+非标' };
+
 function renderRegions() {
   const box = $('regionList');
   if (!regionTasks.length) {
@@ -427,6 +478,7 @@ function renderRegions() {
       <div class="rt-head">
         <span class="rt-region">${esc(t.region)}</span>
         <span class="rt-name">${esc(t.name)}</span>
+        <span class="rt-tag">${esc(sourceLabel[t.source] || '全部')}</span>
         ${t.enabled ? '<span class="rt-tag on">启用</span>' : '<span class="rt-tag">停用</span>'}
         ${t.running ? '<span class="rt-tag run">扫描中</span>' : ''}
       </div>
@@ -457,6 +509,8 @@ async function saveRegion() {
     cron: $('rCron').value.trim() || '0 6 * * *',
     top_n: parseInt($('rTopN').value) || 10,
     speed_min: $('rSpeedMin').value || '1',
+    source: $('rSource').value,
+    nsb_url: $('rNsbUrl').value.trim(),
     enabled: $('rEnabled').checked
   };
   try {
@@ -480,6 +534,9 @@ function editRegion(region) {
   $('rCron').value = t.cron;
   $('rTopN').value = t.top_n;
   $('rSpeedMin').value = t.speed_min;
+  $('rSource').value = t.source || 'official';
+  $('rNsbUrl').value = t.nsb_url || '';
+  onRegionSourceChange();
   $('rEnabled').checked = t.enabled;
   document.querySelector('#regionList').closest('.card').querySelector('details').open = true;
   $('rRegion').focus();

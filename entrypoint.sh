@@ -13,7 +13,7 @@ export TZ="${TZ:-Asia/Shanghai}"
 
 # 把扫描相关环境变量落盘，供 cron 触发的任务加载（crond 派生的进程环境不完整）
 dump_env() {
-  env | grep -E '^(DC_LIST|TOP_N|IP_TYPE|PORT|THREADS|DELAY_MS|SPEED_MIN|SCAN_MODE|RESULTS_DIR|TZ)=' > /app/.container-env || true
+  env | grep -E '^(DC_LIST|TOP_N|IP_TYPE|PORT|THREADS|DELAY_MS|SPEED_MIN|SCAN_MODE|RESULTS_DIR|TZ|MODE|NSB_SOURCE_URL|NSB_FILE|NSB_SPEED_LIMIT|NSB_RESULT_LIMIT)=' > /app/.container-env || true
 }
 
 # "HH:MM" 简写转 cron 表达式并校验（输出到全局 SCHED，非法则返回非 0）

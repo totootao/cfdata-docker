@@ -76,7 +76,7 @@ API（可供外部调用）：
 | `GET /api/results` | 各机房 TopN 结果 JSON |
 | `GET /api/config` | 默认配置、机房列表、国家→机房预设 |
 | `GET /api/logs?lines=200` | cron.log 尾部 |
-| `POST /api/scan` | 触发扫描：`{"dc_list":"LHR,FRA","top_n":10,"speed_min":"5"}` |
+| `POST /api/scan` | 触发扫描：`{"dc_list":"LHR,FRA","top_n":10,"speed_min":"5","source":"official","nsb_url":"..."}`（source 可选 `official`/`nsb`/`all`） |
 | `GET /api/regions` | 地区任务列表（含结果数 / 上次运行 / 下次运行） |
 | `POST /api/regions` | 创建/更新地区任务（见下节） |
 | `DELETE /api/regions/{region}` | 删除地区任务（结果文件不受影响） |
@@ -104,6 +104,7 @@ POST /api/regions
   "cron": "0 6 * * *",
   "top_n": 10,
   "speed_min": "1",
+  "source": "official",
   "enabled": true
 }
 ```
@@ -120,6 +121,61 @@ curl http://服务器IP:8080/random-region/GB/1.txt     # 随机 1 个（bestcf 
 - 地区未配置任务时，txt API 回退到内置的国家→机房预设（共 40+ 国家），但需要对应机房已有扫描数据
 - 扫描互斥：某地区扫描进行中，其他地区/手动触发的任务会排队等待（下轮调度重试），不会并发冲突
 - 容器重启期间错过的触发点不补跑，`next_run` 按当前时间重算
+
+### 非标优选（bestcf 风格 random-region 的数据源）
+
+除 Cloudflare 官方公布的 IP 段外，还支持扫描**非标 IP 库**（每行 `IP 端口` 或 `域名 端口`，支持域名自动解析）。非标扫描一次跑全部地址，按落地机房自动分组存到 `results/nsb/`，与官方结果（`results/*.csv`）互不覆盖。
+
+数据源三种选择（地区任务与 Web 主扫描均可选）：
+
+| 数据源 | 说明 |
+|---|---|
+| `official` | 官方 IP 段（默认，行为同前） |
+| `nsb` | 非标 IP 库：只跑非标扫描，txt API 只输出非标结果 |
+| `all` | 两者都跑（先官方后非标），txt API 合并输出并按 ip:port 去重 |
+
+非标 IP 库 URL 的配置方式（二选一，任务级优先）：
+
+1. 容器全局环境变量（所有非标任务共用）：
+
+```bash
+docker run -d --name cfdata -p 8080:8080 --restart unless-stopped \
+  -e WEB_PORT=8080 \
+  -e NSB_SOURCE_URL="https://example.com/your-nsb-ips.txt" \
+  -v /opt/cfdata/results:/app/results \
+  totootao/cfdata
+```
+
+2. 地区任务的 `nsb_url` 字段（Web 表单或 JSON 请求体指定，仅该任务使用）
+
+非标任务示例：
+
+```json
+POST /api/regions
+{
+  "region": "KR",
+  "name": "韩国",
+  "colos": ["ICN"],
+  "cron": "0 6 * * *",
+  "top_n": 10,
+  "speed_min": "1",
+  "source": "nsb",
+  "nsb_url": "https://example.com/your-nsb-ips.txt",
+  "enabled": true
+}
+```
+
+之后 `GET /random-region/KR/50.txt` 即随机返回 50 个落地韩国机房的非标优选 IP（与 bestcf 的接口语义一致）。
+
+单次/定时模式跑非标（无 Web）：
+
+```bash
+docker run --rm \
+  -e MODE=nsb \
+  -e NSB_SOURCE_URL="https://example.com/your-nsb-ips.txt" \
+  -e TOP_N=10 -e SPEED_MIN=1 \
+  -v "$PWD/results:/app/results" totootao/cfdata
+```
 
 ### 本地运行（单次模式）
 
@@ -189,6 +245,11 @@ cat results/cron.log       # 每次扫描的详细日志
 | `THREADS` | `100` | 扫描并发数 |
 | `DELAY_MS` | `500` | 延迟阈值（毫秒） |
 | `SPEED_MIN` | `1` | 测速达标下限（MB/s） |
+| `MODE` | `official` | 扫描模式：`official`（官方 IP 段）/ `nsb`（非标 IP 库） |
+| `NSB_SOURCE_URL` | （空） | 非标 IP 库 URL（每行 `IP 端口`，支持域名）；`MODE=nsb` 时必填 |
+| `NSB_FILE` | （空） | 非标本地文件（挂载进容器，优先于 URL） |
+| `NSB_SPEED_LIMIT` | `200` | 非标测速达标结果上限（凑够即停止测速） |
+| `NSB_RESULT_LIMIT` | `1000` | 非标延迟测试结果上限 |
 | `RESULTS_DIR` | `/app/results` | 结果输出目录 |
 | `CRON_SCHEDULE` | （空） | 空 = 单次执行后退出；填 cron 表达式或 `HH:MM` = 常驻定时调度 |
 | `RUN_ON_START` | `true` | 定时模式下容器启动时是否先立即执行一次 |

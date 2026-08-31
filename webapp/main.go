@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -85,6 +86,7 @@ type resultDC struct {
 	Count   int         `json:"count"`
 	Rows    []resultRow `json:"rows"`
 	ModTime string      `json:"mod_time"`
+	Source  string      `json:"source"` // official / nsb
 }
 
 type configResp struct {
@@ -95,6 +97,8 @@ type configResp struct {
 	Egress        string         `json:"egress_colo"`
 	CronSchedule  string         `json:"cron_schedule"`
 	Countries     []countryEntry `json:"countries"`
+	NsbSourceURL  string         `json:"nsb_source_url"`
+	NsbSpeedLimit int            `json:"nsb_speed_limit"`
 }
 
 type location struct {
@@ -130,7 +134,7 @@ func (s *server) acquireLock() bool {
 
 func (s *server) releaseLock() { os.RemoveAll(lockDir) }
 
-// POST /api/scan：触发一次扫描（dc_list 形如 "LHR,FRA"）
+// POST /api/scan：触发一次扫描（dc_list 形如 "LHR,FRA"；source: official/nsb/all）
 func (s *server) handleScan(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		httpError(w, http.StatusMethodNotAllowed, "仅支持 POST")
@@ -140,15 +144,18 @@ func (s *server) handleScan(w http.ResponseWriter, r *http.Request) {
 		DCList   string `json:"dc_list"`
 		TopN     int    `json:"top_n"`
 		SpeedMin string `json:"speed_min"`
+		Source   string `json:"source"`
+		NsbURL   string `json:"nsb_url"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		httpError(w, http.StatusBadRequest, "请求体解析失败: "+err.Error())
 		return
 	}
+	source := normalizeSource(req.Source)
 
 	// 数据中心参数校验：仅允许 3 字母 IATA 码，防注入（值会作为环境变量传给脚本）
 	dcs := parseDCList(req.DCList)
-	if len(dcs) == 0 {
+	if len(dcs) == 0 && source != "nsb" {
 		httpError(w, http.StatusBadRequest, "请提供至少一个有效的数据中心（3 字母 IATA 码）")
 		return
 	}
@@ -167,15 +174,38 @@ func (s *server) handleScan(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, "speed_min 必须是数字")
 		return
 	}
+	nsbURL := strings.TrimSpace(req.NsbURL)
+	if source != "official" && nsbURL == "" {
+		nsbURL = os.Getenv("NSB_SOURCE_URL")
+	}
+	if source != "official" && nsbURL == "" && os.Getenv("NSB_FILE") == "" {
+		httpError(w, http.StatusBadRequest, "非标数据源未配置：请提供 nsb_url 或容器环境变量 NSB_SOURCE_URL")
+		return
+	}
 
 	dcList := strings.Join(dcs, ",")
-	if err := s.runScanAsync(dcList, topN, speedMin, "web"); err != nil {
+	// 触发来源：web:all 的非标段在官方段完成后由 onScanDone 链式触发
+	trigger := "web"
+	if source == "all" {
+		trigger = "web:all"
+	}
+	opt := scanOptions{DCList: dcList, TopN: topN, SpeedMin: speedMin, NsbURL: nsbURL}
+	switch source {
+	case "nsb":
+		opt.Mode = "nsb"
+	case "official":
+		opt.Mode = "official"
+	default: // all：先跑官方段
+		opt.Mode = "official"
+	}
+	if err := s.runScanAsync(opt, trigger); err != nil {
 		httpError(w, http.StatusConflict, "已有扫描任务进行中，请稍候")
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]string{
 		"status":  "started",
 		"dc_list": dcList,
+		"source":  source,
 	})
 }
 
@@ -186,9 +216,18 @@ func (s *server) scanState() (bool, string) {
 	return s.running, s.trigger
 }
 
+// scanOptions 一次扫描的参数：official 按 dcList 逐机房；nsb 全量扫非标 IP 库
+type scanOptions struct {
+	DCList   string
+	TopN     int
+	SpeedMin string
+	Mode     string // official / nsb
+	NsbURL   string // nsb 模式的 IP 库 URL（空则用容器全局 NSB_SOURCE_URL）
+}
+
 // runScanAsync 启动一次后台扫描（web 触发与地区定时任务共用同一实现）。
 // 返回非 nil 表示已有任务在跑（互斥：进程内状态 + 文件锁双重保护）。
-func (s *server) runScanAsync(dcList string, topN int, speedMin, trigger string) error {
+func (s *server) runScanAsync(opt scanOptions, trigger string) error {
 	s.mu.Lock()
 	if s.running {
 		s.mu.Unlock()
@@ -198,6 +237,11 @@ func (s *server) runScanAsync(dcList string, topN int, speedMin, trigger string)
 
 	if !s.acquireLock() {
 		return errScanBusy
+	}
+
+	mode := opt.Mode
+	if mode != "nsb" {
+		mode = "official"
 	}
 
 	s.mu.Lock()
@@ -214,12 +258,16 @@ func (s *server) runScanAsync(dcList string, topN int, speedMin, trigger string)
 	}
 
 	cmd := exec.Command(s.scanScript)
-	cmd.Env = filteredEnv("DC_LIST", "TOP_N", "SPEED_MIN")
+	cmd.Env = filteredEnv("DC_LIST", "TOP_N", "SPEED_MIN", "MODE", "NSB_SOURCE_URL")
 	cmd.Env = append(cmd.Env,
-		fmt.Sprintf("DC_LIST=%s", dcList),
-		fmt.Sprintf("TOP_N=%d", topN),
-		fmt.Sprintf("SPEED_MIN=%s", speedMin),
+		fmt.Sprintf("DC_LIST=%s", opt.DCList),
+		fmt.Sprintf("TOP_N=%d", opt.TopN),
+		fmt.Sprintf("SPEED_MIN=%s", opt.SpeedMin),
+		fmt.Sprintf("MODE=%s", mode),
 	)
+	if mode == "nsb" && opt.NsbURL != "" {
+		cmd.Env = append(cmd.Env, fmt.Sprintf("NSB_SOURCE_URL=%s", opt.NsbURL))
+	}
 
 	stdout, _ := cmd.StdoutPipe()
 	cmd.Stderr = cmd.Stdout
@@ -244,7 +292,7 @@ func (s *server) runScanAsync(dcList string, topN int, speedMin, trigger string)
 	}
 
 	go func() {
-		fmt.Fprintf(logFile, "[%s] ===== 开始扫描（%s 触发: %s，Top%d） =====\n", s.now(), trigger, dcList, topN)
+		fmt.Fprintf(logFile, "[%s] ===== 开始扫描（%s 触发: %s，模式: %s，Top%d） =====\n", s.now(), trigger, opt.DCList, mode, opt.TopN)
 		scanner := bufio.NewScanner(io.TeeReader(stdout, logFile))
 		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 		for scanner.Scan() {
@@ -272,8 +320,8 @@ func (s *server) runScanAsync(dcList string, topN int, speedMin, trigger string)
 		logFile.Sync()
 		logFile.Close()
 		s.releaseLock()
-		s.onScanDone(trigger, err)
-		log.Printf("扫描完成（%s 触发: %s）", trigger, dcList)
+		s.onScanDone(trigger, opt, err)
+		log.Printf("扫描完成（%s 触发: %s，模式: %s）", trigger, opt.DCList, mode)
 	}()
 	return nil
 }
@@ -311,32 +359,45 @@ func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 // GET /api/results：各数据中心 TopN 结果
 func (s *server) handleResults(w http.ResponseWriter, r *http.Request) {
-	entries, err := os.ReadDir(s.resultsDir)
-	if err != nil {
-		writeJSON(w, http.StatusOK, []resultDC{})
-		return
+	// official: results/*.csv；nsb: results/nsb/*.csv
+	type srcDir struct {
+		dir    string
+		source string
 	}
+	dirs := []srcDir{{s.resultsDir, "official"}, {filepath.Join(s.resultsDir, "nsb"), "nsb"}}
 	var out []resultDC
-	for _, e := range entries {
-		name := e.Name()
-		if e.IsDir() || !strings.HasSuffix(name, ".csv") {
+	for _, d := range dirs {
+		entries, err := os.ReadDir(d.dir)
+		if err != nil {
 			continue
 		}
-		dc := strings.ToUpper(strings.TrimSuffix(name, ".csv"))
-		if !dcRe.MatchString(dc) {
-			continue
+		for _, e := range entries {
+			name := e.Name()
+			if e.IsDir() || !strings.HasSuffix(name, ".csv") {
+				continue
+			}
+			dc := strings.ToUpper(strings.TrimSuffix(name, ".csv"))
+			if !dcRe.MatchString(dc) {
+				continue
+			}
+			rows := parseCSV(filepath.Join(d.dir, name))
+			info, _ := e.Info()
+			mod := ""
+			if info != nil {
+				mod = info.ModTime().Format("2006-01-02 15:04:05")
+			}
+			out = append(out, resultDC{DC: dc, Count: len(rows), Rows: rows, ModTime: mod, Source: d.source})
 		}
-		rows := parseCSV(filepath.Join(s.resultsDir, name))
-		info, _ := e.Info()
-		mod := ""
-		if info != nil {
-			mod = info.ModTime().Format("2006-01-02 15:04:05")
-		}
-		out = append(out, resultDC{DC: dc, Count: len(rows), Rows: rows, ModTime: mod})
 	}
 	if out == nil {
 		out = []resultDC{}
 	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Source != out[j].Source {
+			return out[i].Source < out[j].Source
+		}
+		return out[i].DC < out[j].DC
+	})
 	writeJSON(w, http.StatusOK, out)
 }
 
@@ -358,6 +419,8 @@ func (s *server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		TopN:          envInt("TOP_N", 10),
 		SpeedMin:      os.Getenv("SPEED_MIN"),
 		CronSchedule:  os.Getenv("CRON_SCHEDULE"),
+		NsbSourceURL:  os.Getenv("NSB_SOURCE_URL"),
+		NsbSpeedLimit: envInt("NSB_SPEED_LIMIT", 200),
 		Locations: []location{
 			{"LHR", "伦敦"}, {"FRA", "法兰克福"}, {"SEA", "西雅图"}, {"AMS", "阿姆斯特丹"},
 			{"CDG", "巴黎"}, {"IAD", "华盛顿"}, {"LAX", "洛杉矶"}, {"SJC", "圣何塞"},

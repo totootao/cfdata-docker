@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CFData 数据中心优选</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d;
+    --text: #e6edf3; --muted: #8b949e; --accent: #3fb950;
+    --accent-dim: #238636; --blue: #58a6ff; --warn: #d29922; --danger: #f85149;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+    min-height: 100vh; padding: 20px;
+  }
+  .wrap { max-width: 1200px; margin: 0 auto; }
+  header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; margin-bottom: 20px; }
+  h1 { font-size: 20px; display: flex; align-items: center; gap: 8px; }
+  h1 .logo { color: var(--accent); }
+  .badges { display: flex; gap: 8px; flex-wrap: wrap; }
+  .badge {
+    font-size: 12px; padding: 4px 10px; border-radius: 12px;
+    background: var(--panel); border: 1px solid var(--border); color: var(--muted);
+  }
+  .badge b { color: var(--text); font-weight: 600; }
+  .grid { display: grid; grid-template-columns: 380px 1fr; gap: 16px; align-items: start; }
+  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+  .card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 16px; margin-bottom: 16px;
+  }
+  .card h2 { font-size: 14px; color: var(--muted); margin-bottom: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .5px; }
+  .locs { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+  .loc {
+    display: flex; align-items: center; gap: 5px; cursor: pointer;
+    border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px;
+    font-size: 13px; transition: all .15s; user-select: none;
+  }
+  .loc:hover { border-color: var(--blue); }
+  .loc.on { border-color: var(--accent-dim); background: rgba(35,134,54,.15); color: var(--accent); }
+  .loc input { display: none; }
+  .loc .code { font-weight: 700; }
+  .loc .city { color: var(--muted); font-size: 12px; }
+  .loc.on .city { color: var(--accent); opacity: .8; }
+  .row { display: flex; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; }
+  .field { flex: 1; min-width: 100px; }
+  .field label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  .field input, .field select {
+    width: 100%; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 8px 10px; color: var(--text); font-size: 14px;
+  }
+  .field input:focus, .field select:focus { outline: none; border-color: var(--blue); }
+  .btn {
+    width: 100%; padding: 11px; border: none; border-radius: 8px;
+    background: var(--accent-dim); color: #fff; font-size: 15px; font-weight: 600;
+    cursor: pointer; transition: background .15s;
+  }
+  .btn:hover:not(:disabled) { background: #2ea043; }
+  .btn:disabled { background: var(--border); color: var(--muted); cursor: not-allowed; }
+  .status-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); }
+  .dot.run { background: var(--accent); animation: pulse 1.2s infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+  .state-txt { font-size: 14px; }
+  .state-txt.run { color: var(--accent); }
+  .meta { font-size: 12px; color: var(--muted); margin-left: auto; }
+  pre.console {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px; font-size: 12px; line-height: 1.6; max-height: 300px;
+    overflow-y: auto; white-space: pre-wrap; word-break: break-all;
+    font-family: "SF Mono", Consolas, "Courier New", monospace; color: var(--muted);
+  }
+  .dc-block { margin-bottom: 4px; }
+  .dc-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
+  .dc-head .dc { font-size: 17px; font-weight: 700; }
+  .dc-head .cnt { font-size: 12px; color: var(--muted); }
+  .dc-head .mt { font-size: 11px; color: var(--muted); margin-left: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; color: var(--muted); font-weight: 500; font-size: 12px; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+  td { padding: 7px 8px; border-bottom: 1px solid rgba(48,54,61,.5); }
+  tr:last-child td { border-bottom: none; }
+  td.rank { color: var(--muted); width: 34px; }
+  tr:nth-child(1) td.rank { color: var(--warn); font-weight: 700; }
+  td.mono, .mono { font-family: "SF Mono", Consolas, monospace; }
+  .speed-cell { display: flex; align-items: center; gap: 8px; }
+  .bar { height: 5px; border-radius: 3px; background: linear-gradient(90deg, var(--accent-dim), var(--accent)); min-width: 4px; }
+  .empty { color: var(--muted); font-size: 13px; padding: 14px 0; text-align: center; }
+  details summary { cursor: pointer; color: var(--muted); font-size: 13px; padding: 4px 0; }
+  details pre { margin-top: 8px; }
+  .hint { font-size: 12px; color: var(--muted); line-height: 1.7; }
+  .hint b { color: var(--warn); }
+  .toast {
+    position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 18px; font-size: 13px; opacity: 0; transition: opacity .3s; pointer-events: none;
+    max-width: 90vw;
+  }
+  .toast.show { opacity: 1; }
+  .toast.err { border-color: var(--danger); color: var(--danger); }
+  .spin { display: inline-block; animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1><span class="logo">●</span> CFData 数据中心优选</h1>
+    <div class="badges">
+      <span class="badge">出口机房 <b id="egress">检测中…</b></span>
+      <span class="badge">定时 <b id="cron">未启用</b></span>
+    </div>
+  </header>
+
+  <div class="grid">
+    <div>
+      <div class="card">
+        <h2>选择数据中心并测速</h2>
+        <div class="locs" id="locs"></div>
+        <div class="row">
+          <div class="field">
+            <label>自定义（IATA 码，逗号分隔）</label>
+            <input id="customDc" placeholder="例如 AMS,CDG,HKG">
+          </div>
+        </div>
+        <div class="row">
+          <div class="field">
+            <label>每个机房取前 N 个</label>
+            <input id="topN" type="number" min="1" max="100" value="10">
+          </div>
+          <div class="field">
+            <label>测速下限（MB/s）</label>
+            <input id="speedMin" type="number" min="0" step="0.5" value="1">
+          </div>
+        </div>
+        <button class="btn" id="startBtn" onclick="startScan()">开始测速</button>
+      </div>
+
+      <div class="card">
+        <h2>运行状态</h2>
+        <div class="status-head">
+          <span class="dot" id="dot"></span>
+          <span class="state-txt" id="stateTxt">空闲</span>
+          <span class="meta" id="meta"></span>
+        </div>
+        <pre class="console" id="console">等待任务…</pre>
+      </div>
+
+      <div class="card">
+        <h2>说明</h2>
+        <div class="hint">
+          <b>anycast 提示：</b>Cloudflare 会把扫描请求路由到离当前网络出口最近的机房，因此只有出口附近的机房能扫到 IP（例如出口在 SEA 时 LHR/FRA 通常为空）。上方「出口机房」即当前出口落地位置。<br>
+          测速达标线（MB/s）越高，筛选越严格；扫描进行中可随时离开页面，任务在后台继续。
+        </div>
+      </div>
+    </div>
+
+    <div>
+      <div class="card" id="resultsCard">
+        <h2>优选结果（按下载速度降序）</h2>
+        <div id="results"><div class="empty">暂无结果，先触发一次测速</div></div>
+        <details style="margin-top:12px">
+          <summary>运行日志（cron.log）</summary>
+          <pre class="console" id="logs"></pre>
+        </details>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+let locations = [], selected = new Set(), config = null;
+let pollTimer = null;
+
+function $(id) { return document.getElementById(id); }
+
+function toast(msg, err) {
+  const t = $('toast');
+  t.textContent = msg;
+  t.className = 'toast show' + (err ? ' err' : '');
+  setTimeout(() => t.className = 'toast', 3000);
+}
+
+async function loadConfig() {
+  try {
+    const r = await fetch('/api/config');
+    config = await r.json();
+    locations = config.locations || [];
+    $('egress').textContent = config.egress_colo || '未知';
+    $('cron').textContent = config.cron_schedule ? config.cron_schedule : '未启用';
+    $('topN').value = config.top_n || 10;
+    $('speedMin').value = config.speed_min || 1;
+    renderLocs();
+    // 默认勾选环境变量里的机房
+    (config.default_dc_list || '').split(',').forEach(dc => selected.add(dc.trim().toUpperCase()));
+    renderLocs();
+  } catch (e) { toast('加载配置失败', true); }
+}
+
+function renderLocs() {
+  const box = $('locs');
+  box.innerHTML = '';
+  locations.forEach(loc => {
+    const el = document.createElement('label');
+    el.className = 'loc' + (selected.has(loc.code) ? ' on' : '');
+    el.innerHTML = `<input type="checkbox" value="${loc.code}" ${selected.has(loc.code) ? 'checked' : ''}><span class="code">${loc.code}</span><span class="city">${loc.city}</span>`;
+    el.onclick = (ev) => {
+      ev.preventDefault();
+      selected.has(loc.code) ? selected.delete(loc.code) : selected.add(loc.code);
+      renderLocs();
+    };
+    box.appendChild(el);
+  });
+}
+
+function getDCList() {
+  const set = new Set(selected);
+  $('customDc').value.split(',').forEach(dc => {
+    dc = dc.trim().toUpperCase();
+    if (/^[A-Z]{3}$/.test(dc)) set.add(dc);
+  });
+  return [...set];
+}
+
+async function startScan() {
+  const dcs = getDCList();
+  if (!dcs.length) { toast('请至少选择一个数据中心', true); return; }
+  try {
+    const r = await fetch('/api/scan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dc_list: dcs.join(','), top_n: parseInt($('topN').value) || 10, speed_min: $('speedMin').value })
+    });
+    if (r.status === 409) { toast('已有任务在运行，请稍候', true); poll(); return; }
+    if (!r.ok) { const e = await r.json(); toast(e.error || '触发失败', true); return; }
+    toast('已开始测速: ' + dcs.join(', '));
+    poll();
+  } catch (e) { toast('网络错误', true); }
+}
+
+async function poll() {
+  try {
+    const r = await fetch('/api/status');
+    const st = await r.json();
+    const btn = $('startBtn'), dot = $('dot'), txt = $('stateTxt');
+    if (st.running) {
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spin">◐</span> 扫描中…';
+      dot.className = 'dot run';
+      txt.className = 'state-txt run';
+      txt.textContent = st.current_dc ? `正在扫描 ${st.current_dc}` : '扫描中';
+      $('meta').textContent = (st.trigger === 'cron' ? '[定时任务] ' : '') + (st.duration || '');
+      if (st.lines && st.lines.length) {
+        const c = $('console');
+        c.textContent = st.lines.join('\n');
+        c.scrollTop = c.scrollHeight;
+      }
+      clearTimeout(pollTimer);
+      pollTimer = setTimeout(poll, 1500);
+    } else {
+      btn.disabled = false;
+      btn.textContent = '开始测速';
+      dot.className = 'dot';
+      txt.className = 'state-txt';
+      txt.textContent = '空闲';
+      $('meta').textContent = st.last_finished_at ? ('上次完成: ' + st.last_finished_at) : '';
+      if (st.lines && st.lines.length) {
+        const c = $('console');
+        c.textContent = st.lines.slice(-30).join('\n');
+        c.scrollTop = c.scrollHeight;
+      }
+      clearTimeout(pollTimer);
+      pollTimer = setTimeout(poll, 5000);
+    }
+  } catch (e) {
+    clearTimeout(pollTimer);
+    pollTimer = setTimeout(poll, 5000);
+  }
+}
+
+async function loadResults() {
+  try {
+    const r = await fetch('/api/results');
+    const data = await r.json();
+    const box = $('results');
+    if (!data.length) {
+      box.innerHTML = '<div class="empty">暂无结果，先触发一次测速</div>';
+      return;
+    }
+    const maxSpeed = Math.max(...data.map(d => Math.max(...d.rows.map(r => r.speed_mb), 0)), 1);
+    box.innerHTML = data.map(d => {
+      const rows = d.rows.length ? d.rows.map((row, i) => `
+        <tr>
+          <td class="rank">${i + 1}</td>
+          <td class="mono">${esc(row.ipport)}</td>
+          <td>${esc(row.city)}</td>
+          <td class="mono">${esc(row.latency)}</td>
+          <td><div class="speed-cell"><span class="bar" style="width:${Math.max(4, row.speed_mb / maxSpeed * 90)}px"></span>${esc(row.speed)}</div></td>
+        </tr>`).join('') : '<tr><td colspan="5" class="empty">该机房未扫到 IP（见上方 anycast 说明）</td></tr>';
+      return `
+        <div class="dc-block">
+          <div class="dc-head">
+            <span class="dc">${d.dc}</span>
+            <span class="cnt">${d.count} 条</span>
+            <span class="mt">${d.mod_time}</span>
+          </div>
+          <table>
+            <thead><tr><th>#</th><th>IP:端口</th><th>城市</th><th>延迟</th><th>下载速度</th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>`;
+    }).join('');
+  } catch (e) { /* 静默 */ }
+}
+
+async function loadLogs() {
+  try {
+    const r = await fetch('/api/logs?lines=150');
+    const d = await r.json();
+    const el = $('logs');
+    el.textContent = (d.lines || []).join('\n');
+  } catch (e) { /* 静默 */ }
+}
+
+function esc(s) {
+  return String(s || '').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+}
+
+// 结果刷新：空闲时每 15s 静默刷新；检测到扫描刚完成时立即刷新
+let lastRunning = false;
+setInterval(async () => {
+  try {
+    const st = await (await fetch('/api/status')).json();
+    if (lastRunning && !st.running) { loadResults(); loadLogs(); }
+    lastRunning = st.running;
+  } catch (e) {}
+}, 2000);
+setInterval(loadResults, 15000);
+
+loadConfig();
+poll();
+loadResults();
+loadLogs();
+setInterval(loadLogs, 30000);
+</script>
+</body>
+</html>

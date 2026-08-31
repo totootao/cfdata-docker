@@ -5,8 +5,13 @@
 ## 项目结构
 
 ```
-├── Dockerfile                  # 多阶段构建：源码编译 CFData + Alpine 运行时
+├── Dockerfile                  # 多阶段构建：源码编译 CFData + Web 控制台 + Alpine 运行时
 ├── scan.sh                     # 核心扫描脚本：逐机房扫描 → 测速 → TopN 筛选
+├── entrypoint.sh               # 入口：单次 / 定时 / Web 三种模式分流
+├── run-scheduled.sh            # 定时任务体：环境加载 + 并发锁 + 日志
+├── webapp/                     # Web 控制台（Go 单二进制，前端经 go:embed 内嵌）
+│   ├── main.go                 # API：触发测速 / 实时进度 / 结果 / 日志
+│   └── static/index.html       # 前端界面（机房选择 + 实时输出 + 结果表格）
 ├── .github/workflows/
 │   ├── docker.yml              # 构建并推送 Docker 镜像到 Docker Hub
 │   └── scan.yml                # 运行扫描并把 Top10 结果提交到仓库
@@ -24,7 +29,53 @@
 
 镜像地址：`totootao/cfdata`（amd64 / arm64），由 `docker.yml` Workflow 自动构建并推送。
 
-### 本地运行
+三种运行模式（可组合）：
+
+| 模式 | 开启方式 | 行为 |
+|---|---|---|
+| 单次 | 不设任何参数 | 扫描一次后退出 |
+| Web 控制台 | `WEB_PORT=8080` | 常驻，浏览器里选地点触发测速 |
+| 定时 | `CRON_SCHEDULE="0 6 * * *"` | 常驻，到点自动扫描（可与 Web 共存） |
+
+### Web 控制台（推荐家里服务器使用）
+
+```bash
+docker run -d --name cfdata -p 8080:8080 --restart unless-stopped \
+  -e WEB_PORT=8080 \
+  -e DC_LIST=LHR,FRA,SEA \
+  -e SPEED_MIN=5 \
+  -v /opt/cfdata/results:/app/results \
+  totootao/cfdata
+```
+
+浏览器打开 `http://服务器IP:8080`：
+
+- **按地点触发测速**：勾选机房（内置 22 个常用机房 + 自定义 IATA 码输入框），设置 TopN 与测速下限，点"开始测速"
+- **实时进度**：当前正在扫描的机房、已运行时长、扫描器实时输出
+- **结果展示**：各机房 TopN 表格（IP:端口 / 城市 / 延迟 / 速度），按下载速度降序，带速度条
+- **互斥保护**：Web 触发与定时任务共用同一把锁，扫描中不会重复触发（返回 409）
+
+Web + 定时共存：
+
+```bash
+docker run -d --name cfdata -p 8080:8080 --restart unless-stopped \
+  -e WEB_PORT=8080 \
+  -e CRON_SCHEDULE="0 6 * * *" \
+  -v /opt/cfdata/results:/app/results \
+  totootao/cfdata
+```
+
+API（可供外部调用）：
+
+| 接口 | 说明 |
+|---|---|
+| `GET /api/status` | 运行状态 + 最近输出 |
+| `GET /api/results` | 各机房 TopN 结果 JSON |
+| `GET /api/config` | 默认配置与机房列表 |
+| `GET /api/logs?lines=200` | cron.log 尾部 |
+| `POST /api/scan` | 触发扫描：`{"dc_list":"LHR,FRA","top_n":10,"speed_min":"5"}` |
+
+### 本地运行（单次模式）
 
 ```bash
 # 默认筛选 LHR/FRA/SEA 前十（单次模式，扫完即退出）
@@ -95,6 +146,7 @@ cat results/cron.log       # 每次扫描的详细日志
 | `RESULTS_DIR` | `/app/results` | 结果输出目录 |
 | `CRON_SCHEDULE` | （空） | 空 = 单次执行后退出；填 cron 表达式或 `HH:MM` = 常驻定时调度 |
 | `RUN_ON_START` | `true` | 定时模式下容器启动时是否先立即执行一次 |
+| `WEB_PORT` | （空） | 空 = 不启用 Web；填端口（如 `8080`）= 启动 Web 控制台，可与定时共存 |
 | `TZ` | `Asia/Shanghai` | 时区（影响调度时间） |
 
 常用机房 IATA 码：`LHR` 伦敦、`FRA` 法兰克福、`SEA` 西雅图、`AMS` 阿姆斯特丹、`CDG` 巴黎、`IAD` 华盛顿、`LAX` 洛杉矶、`SJC` 圣何塞、`HKG` 香港、`NRT` 东京、`SIN` 新加坡。

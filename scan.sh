@@ -56,8 +56,10 @@ for DC in $(echo "$DC_LIST" | tr ',' ' '); do
   echo ""
   echo "==================== [$DC] 开始扫描（Top${TOP_N}） ===================="
 
-  RAW="$TMP_DIR/${DC}-raw.csv"
-  "$CFDATA_BIN" -cli \
+  # 注意：cfdata 的 -offout 会经 safeFilename() 剥掉目录部分（仅保留文件名），
+  # 因此这里 cd 到 WORK_DIR 用相对文件名输出，再用绝对路径读取
+  RAW="$WORK_DIR/${DC}-raw.csv"
+  ( cd "$WORK_DIR" && "$CFDATA_BIN" -cli \
     -config "$WORK_DIR/cfdata-config.json" \
     -skipgeo \
     -mode official \
@@ -72,8 +74,8 @@ for DC in $(echo "$DC_LIST" | tr ',' ' '); do
     -offurl auto \
     -format csv \
     -fields ip,port,ipport,dc,city,latency,speed \
-    -offout "$RAW" \
-    -nocolor
+    -offout "${DC}-raw.csv" \
+    -nocolor )
 
   DC_LOWER=$(echo "$DC" | tr 'A-Z' 'a-z')
   CSV="$RESULTS_DIR/${DC_LOWER}.csv"
@@ -105,6 +107,7 @@ for DC in $(echo "$DC_LIST" | tr ',' ' '); do
       tail -n +2 "$CSV" | head -n 3 | sed 's/^/    /'
     fi
   } >> "$SUMMARY"
+  rm -f "$RAW"
 done
 
 echo ""

@@ -27,13 +27,59 @@
 ### 本地运行
 
 ```bash
-# 默认筛选 LHR/FRA/SEA 前十
+# 默认筛选 LHR/FRA/SEA 前十（单次模式，扫完即退出）
 docker run --rm -v "$PWD/results:/app/results" totootao/cfdata
 
 # 自定义：只测法兰克福，取前 10，测速下限 5MB/s
 docker run --rm -e DC_LIST=FRA -e TOP_N=10 -e SPEED_MIN=5 \
   -v "$PWD/results:/app/results" totootao/cfdata
 ```
+
+### 定时模式（适合家里服务器常驻）
+
+设置 `CRON_SCHEDULE` 后容器常驻，到点自动扫描，每次运行覆盖 `results/`，历史记录追加在 `results/cron.log`：
+
+```bash
+docker run -d --name cfdata --restart unless-stopped \
+  -e CRON_SCHEDULE="0 6 * * *" \
+  -e DC_LIST=LHR,FRA,SEA \
+  -e TOP_N=10 \
+  -e SPEED_MIN=5 \
+  -v /opt/cfdata/results:/app/results \
+  totootao/cfdata
+```
+
+`CRON_SCHEDULE` 支持两种写法：
+
+- 完整 cron 表达式：`"0 6 * * *"`（每天 6 点）、`"0 6,18 * * *"`（每天 6 点和 18 点）、`"*/30 * * * *"`（每 30 分钟）
+- 每日定时简写：`"06:00"` 等价于 `"0 6 * * *"`
+
+docker-compose 示例：
+
+```yaml
+services:
+  cfdata:
+    image: totootao/cfdata
+    container_name: cfdata
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+      CRON_SCHEDULE: "0 6 * * *"   # 每天北京时间 06:00
+      DC_LIST: LHR,FRA,SEA
+      TOP_N: "10"
+      SPEED_MIN: "5"
+    volumes:
+      - ./results:/app/results
+```
+
+查看运行情况：
+
+```bash
+docker logs -f cfdata      # 调度器输出
+cat results/cron.log       # 每次扫描的详细日志
+```
+
+内置保护：扫描进行中若到下一个触发点，自动跳过该次（并发锁）；锁超过 3 小时视为残留自动清除。
 
 ### 环境变量
 
@@ -47,6 +93,9 @@ docker run --rm -e DC_LIST=FRA -e TOP_N=10 -e SPEED_MIN=5 \
 | `DELAY_MS` | `500` | 延迟阈值（毫秒） |
 | `SPEED_MIN` | `1` | 测速达标下限（MB/s） |
 | `RESULTS_DIR` | `/app/results` | 结果输出目录 |
+| `CRON_SCHEDULE` | （空） | 空 = 单次执行后退出；填 cron 表达式或 `HH:MM` = 常驻定时调度 |
+| `RUN_ON_START` | `true` | 定时模式下容器启动时是否先立即执行一次 |
+| `TZ` | `Asia/Shanghai` | 时区（影响调度时间） |
 
 常用机房 IATA 码：`LHR` 伦敦、`FRA` 法兰克福、`SEA` 西雅图、`AMS` 阿姆斯特丹、`CDG` 巴黎、`IAD` 华盛顿、`LAX` 洛杉矶、`SJC` 圣何塞、`HKG` 香港、`NRT` 东京、`SIN` 新加坡。
 

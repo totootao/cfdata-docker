@@ -30,16 +30,22 @@ RUN mkdir -p /out/seed \
 # =============================================================================
 FROM alpine:3.21
 
+# busybox 自带 crond/crontab，满足定时模式；tzdata 支持时区调度
 RUN apk add --no-cache bash curl tzdata ca-certificates
 
 WORKDIR /app
 COPY --from=builder /out/cfdata /app/cfdata
 COPY --from=builder /out/seed/ /app/seed/
-COPY scan.sh /app/scan.sh
+COPY scan.sh run-scheduled.sh entrypoint.sh /app/
 
-RUN chmod +x /app/cfdata /app/scan.sh \
+RUN chmod +x /app/cfdata /app/scan.sh /app/run-scheduled.sh /app/entrypoint.sh \
     # 生成 CLI 配置模板（程序首次运行会生成后退出，属正常行为）
     && /app/cfdata -cli -config /app/cfdata-config.json -nocolor >/dev/null 2>&1 || true
 
+# 定时模式参数：CRON_SCHEDULE 为空则单次执行后退出，填值则常驻定时调度
+ENV TZ=Asia/Shanghai \
+    CRON_SCHEDULE="" \
+    RUN_ON_START="true"
+
 VOLUME ["/app/results"]
-ENTRYPOINT ["/app/scan.sh"]
+ENTRYPOINT ["/app/entrypoint.sh"]

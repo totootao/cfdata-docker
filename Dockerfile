@@ -1,19 +1,22 @@
 # syntax=docker/dockerfile:1
 
 # =============================================================================
-# 阶段 1: 从源码编译 CFData（Go 静态编译，天然支持多架构交叉构建）
+# 阶段 1: 从源码编译 CFData（Go 静态编译；在构建平台原生运行、交叉编译到目标架构，避免 QEMU 模拟）
 # =============================================================================
-FROM golang:1.25-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS builder
 
 # CFData 源码仓库（默认使用 totootao 的 fork，可通过 build-args 切换）
 ARG CFDATA_REPO=https://github.com/totootao/CFData-WEB.git
 ARG CFDATA_REF=main
+ARG TARGETOS
+ARG TARGETARCH
 
 RUN apk add --no-cache git
 WORKDIR /src
 RUN git clone --depth 1 "${CFDATA_REPO}" cfdata
 WORKDIR /src/cfdata/combined_refactor
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/cfdata .
+RUN CGO_ENABLED=0 GOOS="${TARGETOS:-linux}" GOARCH="${TARGETARCH:-amd64}" \
+    go build -trimpath -ldflags="-s -w" -o /out/cfdata .
 
 # 构建时预下载官方 IP 库与机房位置表作为种子缓存（运行时优先使用缓存，下载失败不阻断构建）
 RUN mkdir -p /out/seed \

@@ -1,0 +1,8 @@
+# 本地运行产物
+cfdata
+cfdata-config.json
+ips-v4.txt
+ips-v6.txt
+locations.json
+GeoLite2-ASN.mmdb
+*.log

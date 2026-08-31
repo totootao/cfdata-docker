@@ -1,0 +1,68 @@
+name: Scan Top10 per Datacenter
+
+on:
+  workflow_dispatch:
+    inputs:
+      dc_list:
+        description: "数据中心列表（IATA 码，逗号分隔）"
+        required: false
+        default: "LHR,FRA,SEA"
+      top_n:
+        description: "每个数据中心取前 N 个"
+        required: false
+        default: "10"
+  schedule:
+    # 每周一 19:30 UTC（镜像构建完成后）运行
+    - cron: "30 19 * * 1"
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build local image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: cfdata-local:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run scan (LHR/FRA/SEA Top10)
+        env:
+          DC_LIST: ${{ github.event.inputs.dc_list || 'LHR,FRA,SEA' }}
+          TOP_N: ${{ github.event.inputs.top_n || '10' }}
+        run: |
+          docker run --rm \
+            -e DC_LIST="${DC_LIST}" \
+            -e TOP_N="${TOP_N}" \
+            -v "$PWD/results:/app/results" \
+            cfdata-local:latest
+
+      - name: Show results
+        run: |
+          ls -la results/
+          for f in results/*.txt results/*.csv; do
+            [ -f "$f" ] || continue
+            echo "===== $f ====="
+            head -n 12 "$f"
+            echo
+          done
+
+      - name: Commit results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add results/
+          if git diff --cached --quiet; then
+            echo "结果无变化，跳过提交"
+          else
+            git commit -m "chore: update top10 results ($(date -u '+%Y-%m-%d %H:%M UTC'))"
+            git push
+          fi

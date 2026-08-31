@@ -90,10 +90,12 @@ for DC in $(echo "$DC_LIST" | tr ',' ' '); do
 
   # 1. 去掉 UTF-8 BOM
   # 2. 仅保留目标数据中心的行（第 4 列，防止目标机房无 IP 时工具回退导出全部机房数据）
-  # 3. 取前 TOP_N 行（工具导出已按下载速度降序排列）
+  # 3. 剔除测速失败行（速度列非 "xxMB/s" 格式，如"测速失败"）——延迟达标但下载不行的 IP 不能要
+  # 4. 取前 TOP_N 行（工具导出已按下载速度降序排列）
   {
     head -n 1 "$RAW" | tail -c +4
-    tail -n +2 "$RAW" | awk -F',' -v dc="$DC" 'toupper($4) == toupper(dc)'
+    tail -n +2 "$RAW" | awk -F',' -v dc="$DC" \
+      'toupper($4) == toupper(dc) && $7 ~ /^[0-9]+(\.[0-9]+)?MB\/s$/'
   } | head -n $((TOP_N + 1)) > "$CSV"
 
   # 提取 ip:port 纯文本列表（跳过表头，供客户端直接使用）

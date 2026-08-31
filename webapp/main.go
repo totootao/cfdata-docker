@@ -425,6 +425,7 @@ func parseDCList(s string) []string {
 }
 
 // 解析结果 CSV（含 UTF-8 BOM），列: IP,端口,ip:port,数据中心,城市,延迟,速度
+// 速度列非法（如"测速失败"）的行直接跳过：延迟达标但下载测速失败的 IP 不参与优选
 func parseCSV(path string) []resultRow {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -444,7 +445,9 @@ func parseCSV(path string) []resultRow {
 		}
 		speed := strings.TrimSpace(f[6])
 		speedMB := 0.0
-		if v, err := strconv.ParseFloat(strings.TrimSuffix(speed, "MB/s"), 64); err == nil {
+		if v, err := strconv.ParseFloat(strings.TrimSuffix(speed, "MB/s"), 64); err != nil {
+			continue // 测速失败/格式异常的行丢弃
+		} else {
 			speedMB = v
 		}
 		rows = append(rows, resultRow{

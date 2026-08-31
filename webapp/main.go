@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -33,9 +34,10 @@ const (
 )
 
 var (
-	dcRe      = regexp.MustCompile(dcPattern)
-	progressRe = regexp.MustCompile(`\[([A-Za-z]{3})\]`)
-	egressRe  = regexp.MustCompile(`colo=([A-Za-z]{3})`)
+	dcRe        = regexp.MustCompile(dcPattern)
+	progressRe  = regexp.MustCompile(`\[([A-Za-z]{3})\]`)
+	egressRe    = regexp.MustCompile(`colo=([A-Za-z]{3})`)
+	errScanBusy = errors.New("scan busy")
 )
 
 type server struct {
@@ -44,21 +46,26 @@ type server struct {
 	current  string    // 当前正在扫描的数据中心
 	started  time.Time // 本次扫描开始时间
 	finished time.Time // 最近一次扫描结束时间
-	trigger  string    // 触发来源（web / cron）
+	trigger  string    // 触发来源（web / cron / region:XX）
 	lines    []string  // 最近输出（环形缓冲）
 
 	scanScript string
 	resultsDir string
 	logFile    string
+
+	// 地区定时任务（每个地区一条 cron，进程内调度）
+	regionMu sync.Mutex
+	regions  map[string]*regionTask
+	nextRun  map[string]time.Time
 }
 
 type statusResp struct {
-	Running  bool   `json:"running"`
-	Current  string `json:"current_dc"`
-	Started  string `json:"started_at,omitempty"`
-	Duration string `json:"duration,omitempty"`
-	Finished string `json:"last_finished_at,omitempty"`
-	Trigger  string `json:"trigger,omitempty"`
+	Running  bool     `json:"running"`
+	Current  string   `json:"current_dc"`
+	Started  string   `json:"started_at,omitempty"`
+	Duration string   `json:"duration,omitempty"`
+	Finished string   `json:"last_finished_at,omitempty"`
+	Trigger  string   `json:"trigger,omitempty"`
 	Lines    []string `json:"lines"`
 }
 
@@ -81,12 +88,13 @@ type resultDC struct {
 }
 
 type configResp struct {
-	DefaultDCList string   `json:"default_dc_list"`
-	TopN          int      `json:"top_n"`
-	SpeedMin      string   `json:"speed_min"`
-	Locations     []location `json:"locations"`
-	Egress        string   `json:"egress_colo"`
-	CronSchedule  string   `json:"cron_schedule"`
+	DefaultDCList string         `json:"default_dc_list"`
+	TopN          int            `json:"top_n"`
+	SpeedMin      string         `json:"speed_min"`
+	Locations     []location     `json:"locations"`
+	Egress        string         `json:"egress_colo"`
+	CronSchedule  string         `json:"cron_schedule"`
+	Countries     []countryEntry `json:"countries"`
 }
 
 type location struct {
@@ -160,28 +168,46 @@ func (s *server) handleScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	dcList := strings.Join(dcs, ",")
+	if err := s.runScanAsync(dcList, topN, speedMin, "web"); err != nil {
+		httpError(w, http.StatusConflict, "已有扫描任务进行中，请稍候")
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{
+		"status":  "started",
+		"dc_list": dcList,
+	})
+}
+
+// scanState 返回当前扫描状态与触发来源
+func (s *server) scanState() (bool, string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.running, s.trigger
+}
+
+// runScanAsync 启动一次后台扫描（web 触发与地区定时任务共用同一实现）。
+// 返回非 nil 表示已有任务在跑（互斥：进程内状态 + 文件锁双重保护）。
+func (s *server) runScanAsync(dcList string, topN int, speedMin, trigger string) error {
 	s.mu.Lock()
 	if s.running {
 		s.mu.Unlock()
-		httpError(w, http.StatusConflict, "已有扫描任务进行中，请稍候")
-		return
+		return errScanBusy
 	}
 	s.mu.Unlock()
 
 	if !s.acquireLock() {
-		httpError(w, http.StatusConflict, "已有扫描任务进行中（定时任务或其他触发），请稍候")
-		return
+		return errScanBusy
 	}
 
 	s.mu.Lock()
 	s.running = true
 	s.current = ""
 	s.started = time.Now()
-	s.trigger = "web"
+	s.trigger = trigger
 	s.lines = []string{}
 	s.mu.Unlock()
 
-	dcList := strings.Join(dcs, ",")
 	logFile, err := os.OpenFile(s.logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		log.Printf("打开日志文件失败: %v", err)
@@ -205,8 +231,7 @@ func (s *server) handleScan(w http.ResponseWriter, r *http.Request) {
 		if logFile != nil {
 			logFile.Close()
 		}
-		httpError(w, http.StatusInternalServerError, "启动扫描失败: "+err.Error())
-		return
+		return err
 	}
 
 	logLine := func(line string) {
@@ -219,7 +244,7 @@ func (s *server) handleScan(w http.ResponseWriter, r *http.Request) {
 	}
 
 	go func() {
-		fmt.Fprintf(logFile, "[%s] ===== 开始扫描（web 触发: %s，Top%d） =====\n", s.now(), dcList, topN)
+		fmt.Fprintf(logFile, "[%s] ===== 开始扫描（%s 触发: %s，Top%d） =====\n", s.now(), trigger, dcList, topN)
 		scanner := bufio.NewScanner(io.TeeReader(stdout, logFile))
 		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 		for scanner.Scan() {
@@ -247,13 +272,10 @@ func (s *server) handleScan(w http.ResponseWriter, r *http.Request) {
 		logFile.Sync()
 		logFile.Close()
 		s.releaseLock()
-		log.Printf("web 触发扫描完成: %s", dcList)
+		s.onScanDone(trigger, err)
+		log.Printf("扫描完成（%s 触发: %s）", trigger, dcList)
 	}()
-
-	writeJSON(w, http.StatusAccepted, map[string]string{
-		"status":  "started",
-		"dc_list": dcList,
-	})
+	return nil
 }
 
 // GET /api/status：运行状态 + 最近输出
@@ -344,6 +366,7 @@ func (s *server) handleConfig(w http.ResponseWriter, r *http.Request) {
 			{"YYZ", "多伦多"}, {"GRU", "圣保罗"}, {"JNB", "约翰内斯堡"}, {"SYD", "悉尼"},
 			{"BOM", "孟买"}, {"DXB", "迪拜"},
 		},
+		Countries: countryColos,
 	}
 	if resp.DefaultDCList == "" {
 		resp.DefaultDCList = "LHR,FRA,SEA"
@@ -495,8 +518,12 @@ func main() {
 		scanScript: envOr("SCAN_SCRIPT", "/app/scan.sh"),
 		resultsDir: envOr("RESULTS_DIR", "/app/results"),
 		logFile:    filepath.Join(envOr("RESULTS_DIR", "/app/results"), "cron.log"),
+		regions:    map[string]*regionTask{},
+		nextRun:    map[string]time.Time{},
 	}
 	os.MkdirAll(s.resultsDir, 0o755)
+	s.loadRegions()
+	s.startScheduler()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleRoot)
@@ -506,6 +533,14 @@ func main() {
 	mux.HandleFunc("/api/logs", s.handleLogs)
 	mux.HandleFunc("/api/config", s.handleConfig)
 	mux.HandleFunc("/api/summary", s.handleSummary)
+	// 地区定时任务管理（每地区一条 cron，Web 配置，regions.json 持久化）
+	mux.HandleFunc("GET /api/regions", s.handleRegionsList)
+	mux.HandleFunc("POST /api/regions", s.handleRegionSave)
+	mux.HandleFunc("DELETE /api/regions/{region}", s.handleRegionDelete)
+	mux.HandleFunc("POST /api/regions/{region}/scan", s.handleRegionScan)
+	// bestcf 风格优选输出 API
+	mux.HandleFunc("GET /random-region/{region}/{file}", s.handleRandomRegion)
+	mux.HandleFunc("GET /region/", s.handleRegionTop)
 
 	addr := ":" + port
 	log.Printf("CFData Web 控制台启动: http://0.0.0.0%s (结果目录: %s)", addr, s.resultsDir)

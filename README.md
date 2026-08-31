@@ -11,11 +11,13 @@
 ├── run-scheduled.sh            # 定时任务体：环境加载 + 并发锁 + 日志
 ├── webapp/                     # Web 控制台（Go 单二进制，前端经 go:embed 内嵌）
 │   ├── main.go                 # API：触发测速 / 实时进度 / 结果 / 日志
-│   └── static/index.html       # 前端界面（机房选择 + 实时输出 + 结果表格）
+│   ├── regions.go              # 地区定时任务：存储 / CRUD / cron 调度 / txt 输出 API
+│   ├── cronexpr.go             # 最小 cron 解析器（5 段表达式 + HH:MM 简写）
+│   └── static/index.html       # 前端界面（机房选择 + 地区任务管理 + 实时输出 + 结果表格）
 ├── .github/workflows/
 │   ├── docker.yml              # 构建并推送 Docker 镜像到 Docker Hub
 │   └── scan.yml                # 运行扫描并把 Top10 结果提交到仓库
-└── results/                    # 扫描结果（lhr/fra/sea 的 csv + txt）
+└── results/                    # 扫描结果（lhr/fra/sea 的 csv + txt + regions.json）
 ```
 
 ## 工作原理
@@ -51,9 +53,10 @@ docker run -d --name cfdata -p 8080:8080 --restart unless-stopped \
 浏览器打开 `http://服务器IP:8080`：
 
 - **按地点触发测速**：勾选机房（内置 22 个常用机房 + 自定义 IATA 码输入框），设置 TopN 与测速下限，点"开始测速"
+- **地区定时任务**：每个地区一条独立 cron（详见下节），到点自动扫描该地区的机房
 - **实时进度**：当前正在扫描的机房、已运行时长、扫描器实时输出
 - **结果展示**：各机房 TopN 表格（IP:端口 / 城市 / 延迟 / 速度），按下载速度降序，带速度条
-- **互斥保护**：Web 触发与定时任务共用同一把锁，扫描中不会重复触发（返回 409）
+- **互斥保护**：Web 触发、地区定时、CRON_SCHEDULE 共用同一把锁，扫描中不会重复触发（返回 409）
 
 Web + 定时共存：
 
@@ -71,9 +74,52 @@ API（可供外部调用）：
 |---|---|
 | `GET /api/status` | 运行状态 + 最近输出 |
 | `GET /api/results` | 各机房 TopN 结果 JSON |
-| `GET /api/config` | 默认配置与机房列表 |
+| `GET /api/config` | 默认配置、机房列表、国家→机房预设 |
 | `GET /api/logs?lines=200` | cron.log 尾部 |
 | `POST /api/scan` | 触发扫描：`{"dc_list":"LHR,FRA","top_n":10,"speed_min":"5"}` |
+| `GET /api/regions` | 地区任务列表（含结果数 / 上次运行 / 下次运行） |
+| `POST /api/regions` | 创建/更新地区任务（见下节） |
+| `DELETE /api/regions/{region}` | 删除地区任务（结果文件不受影响） |
+| `POST /api/regions/{region}/scan` | 立即触发该地区扫描 |
+| `GET /region/{region}.txt` | 该地区优选结果（按下载速度降序，最多 100 条） |
+| `GET /random-region/{region}/{n}.txt` | 该地区随机 n 个 IP（bestcf 风格） |
+
+### 地区定时任务（每个地区一条 cron）
+
+在 Web 控制台左侧「地区定时任务」卡片中配置：**一个地区 = 一条独立 cron**，到点自动扫描该地区包含的所有机房。配置保存在挂载卷的 `results/regions.json`，改完即生效（进程内调度，无需重启容器），容器重启后自动恢复。
+
+- **地区标识**：输入国家码（如 `GB`、`JP`、`US`）自动填充该国家的预设机房列表，也可用任意自定义标识（如 `MY-HOME`）
+- **机房列表**：逗号分隔的 IATA 码，预设值仅作参考，可自由增删（单个任务最多 10 个机房）
+- **cron**：支持标准 5 段表达式（`0 6 * * *`）或 `HH:MM` 每日简写（`06:00`）
+- **其余参数**：每个任务独立设置 TopN 与测速下限（MB/s），可随时停用/启用
+
+一个任务示例（等价的 JSON 请求体）：
+
+```json
+POST /api/regions
+{
+  "region": "GB",
+  "name": "英国",
+  "colos": ["LHR", "MAN"],
+  "cron": "0 6 * * *",
+  "top_n": 10,
+  "speed_min": "1",
+  "enabled": true
+}
+```
+
+配置好后即可用 txt API 直取该地区的结果（供订阅/脚本消费）：
+
+```bash
+curl http://服务器IP:8080/region/GB.txt              # 按速度降序的优选列表
+curl http://服务器IP:8080/random-region/GB/1.txt     # 随机 1 个（bestcf 风格，可换任意 n）
+```
+
+说明：
+
+- 地区未配置任务时，txt API 回退到内置的国家→机房预设（共 40+ 国家），但需要对应机房已有扫描数据
+- 扫描互斥：某地区扫描进行中，其他地区/手动触发的任务会排队等待（下轮调度重试），不会并发冲突
+- 容器重启期间错过的触发点不补跑，`next_run` 按当前时间重算
 
 ### 本地运行（单次模式）
 

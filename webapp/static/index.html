@@ -92,6 +92,22 @@
   details pre { margin-top: 8px; }
   .hint { font-size: 12px; color: var(--muted); line-height: 1.7; }
   .hint b { color: var(--warn); }
+  .rtask { border: 1px solid var(--border); border-radius: 8px; padding: 10px; margin-bottom: 10px; }
+  .rt-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 4px; }
+  .rt-region { font-weight: 700; font-size: 14px; color: var(--blue); }
+  .rt-name { font-size: 13px; }
+  .rt-tag { font-size: 11px; padding: 2px 8px; border-radius: 10px; border: 1px solid var(--border); color: var(--muted); }
+  .rt-tag.on { color: var(--accent); border-color: var(--accent-dim); }
+  .rt-tag.run { color: var(--warn); border-color: var(--warn); }
+  .rt-meta { font-size: 12px; color: var(--muted); line-height: 1.7; }
+  .rt-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+  .rt-actions button, .rt-actions a {
+    font-size: 12px; padding: 5px 10px; border-radius: 6px; cursor: pointer;
+    background: var(--bg); border: 1px solid var(--border); color: var(--text); text-decoration: none;
+  }
+  .rt-actions button:hover, .rt-actions a:hover { border-color: var(--blue); color: var(--blue); }
+  .rt-actions .danger:hover { border-color: var(--danger) !important; color: var(--danger) !important; }
+  .chk { display: flex; align-items: center; gap: 6px; font-size: 13px; margin: 10px 0; cursor: pointer; user-select: none; }
   .toast {
     position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
     background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
@@ -136,6 +152,53 @@
           </div>
         </div>
         <button class="btn" id="startBtn" onclick="startScan()">开始测速</button>
+      </div>
+
+      <div class="card">
+        <h2>地区定时任务（每个地区一条 cron）</h2>
+        <div id="regionList"><div class="empty">加载中…</div></div>
+        <details>
+          <summary>新增 / 编辑任务</summary>
+          <div class="row" style="margin-top:8px">
+            <div class="field">
+              <label>地区（国家码或自定义标识）</label>
+              <input id="rRegion" list="countryList" placeholder="例如 GB / MY-HOME" oninput="onRegionInput()">
+              <datalist id="countryList"></datalist>
+            </div>
+            <div class="field">
+              <label>任务名称</label>
+              <input id="rName" placeholder="例如 英国">
+            </div>
+          </div>
+          <div class="row">
+            <div class="field">
+              <label>机房列表（IATA 码，逗号分隔，选国家自动填充）</label>
+              <input id="rColos" placeholder="例如 LHR,MAN">
+            </div>
+          </div>
+          <div class="row">
+            <div class="field">
+              <label>cron（5 段或 HH:MM）</label>
+              <input id="rCron" placeholder="0 6 * * * 或 06:00">
+            </div>
+            <div class="field" style="max-width:80px">
+              <label>前 N</label>
+              <input id="rTopN" type="number" min="1" max="100" value="10">
+            </div>
+            <div class="field" style="max-width:100px">
+              <label>下限 MB/s</label>
+              <input id="rSpeedMin" type="number" min="0" step="0.5" value="1">
+            </div>
+          </div>
+          <label class="chk"><input type="checkbox" id="rEnabled" checked> 启用定时</label>
+          <div class="row" style="margin-bottom:0">
+            <button class="btn" type="button" onclick="saveRegion()">保存任务</button>
+          </div>
+          <div class="hint" style="margin-top:10px">
+            输入国家码（如 GB/JP/US）自动填充预设机房；机房列表可自由修改。保存后可用下方 API 直取结果：<br>
+            <span class="mono">/region/{地区}.txt</span> 按速度降序 · <span class="mono">/random-region/{地区}/{n}.txt</span> 随机 n 个
+          </div>
+        </details>
       </div>
 
       <div class="card">
@@ -189,11 +252,13 @@ async function loadConfig() {
     const r = await fetch('/api/config');
     config = await r.json();
     locations = config.locations || [];
+    countries = config.countries || [];
     $('egress').textContent = config.egress_colo || '未知';
     $('cron').textContent = config.cron_schedule ? config.cron_schedule : '未启用';
     $('topN').value = config.top_n || 10;
     $('speedMin').value = config.speed_min || 1;
     renderLocs();
+    renderCountryOptions();
     // 默认勾选环境变量里的机房
     (config.default_dc_list || '').split(',').forEach(dc => selected.add(dc.trim().toUpperCase()));
     renderLocs();
@@ -325,6 +390,121 @@ async function loadLogs() {
   } catch (e) { /* 静默 */ }
 }
 
+// ---------- 地区定时任务 ----------
+
+let countries = [], regionTasks = [];
+
+function renderCountryOptions() {
+  $('countryList').innerHTML = countries.map(c =>
+    `<option value="${esc(c.code)}">${esc(c.name)}（${esc(c.colos.join(','))}）</option>`).join('');
+}
+
+// 输入国家码时自动填充预设机房（仅当机房框为空或也是某国家的预设时覆盖，避免抹掉用户输入）
+function onRegionInput() {
+  const code = $('rRegion').value.trim().toUpperCase();
+  const c = countries.find(x => x.code === code);
+  if (!c) return;
+  $('rColos').value = c.colos.join(',');
+  if (!$('rName').value) $('rName').value = c.name;
+}
+
+async function loadRegions() {
+  try {
+    const r = await fetch('/api/regions');
+    regionTasks = await r.json();
+    renderRegions();
+  } catch (e) { $('regionList').innerHTML = '<div class="empty">加载失败</div>'; }
+}
+
+function renderRegions() {
+  const box = $('regionList');
+  if (!regionTasks.length) {
+    box.innerHTML = '<div class="empty">暂无任务，展开下方表单添加</div>';
+    return;
+  }
+  box.innerHTML = regionTasks.map(t => `
+    <div class="rtask">
+      <div class="rt-head">
+        <span class="rt-region">${esc(t.region)}</span>
+        <span class="rt-name">${esc(t.name)}</span>
+        ${t.enabled ? '<span class="rt-tag on">启用</span>' : '<span class="rt-tag">停用</span>'}
+        ${t.running ? '<span class="rt-tag run">扫描中</span>' : ''}
+      </div>
+      <div class="rt-meta">机房 ${esc(t.colos.join(','))} · cron <span class="mono">${esc(t.cron)}</span> · Top${t.top_n} · ≥${esc(t.speed_min)}MB/s</div>
+      <div class="rt-meta">
+        ${t.result_count} 条结果 · 上次 ${t.last_run ? esc(t.last_run) + ' ' + (t.last_status === 'ok' ? '✓' : '✗') : '未运行'}
+        · 下次 ${t.next_run ? esc(t.next_run) : '-'}
+      </div>
+      <div class="rt-actions">
+        <button onclick="scanRegion('${esc(t.region)}')">立即扫描</button>
+        <button onclick="editRegion('${esc(t.region)}')">编辑</button>
+        <button class="danger" onclick="delRegion('${esc(t.region)}')">删除</button>
+        <a href="/region/${esc(t.region)}.txt" target="_blank">优选</a>
+        <a href="/random-region/${esc(t.region)}/1.txt" target="_blank">随机1</a>
+      </div>
+    </div>`).join('');
+}
+
+async function saveRegion() {
+  const region = $('rRegion').value.trim().toUpperCase();
+  const colos = $('rColos').value.split(',').map(s => s.trim().toUpperCase()).filter(s => /^[A-Z]{3}$/.test(s));
+  if (!region) { toast('请填写地区标识', true); return; }
+  if (!colos.length) { toast('请至少填写一个有效的 3 字母机房码', true); return; }
+  const body = {
+    region,
+    name: $('rName').value.trim(),
+    colos,
+    cron: $('rCron').value.trim() || '0 6 * * *',
+    top_n: parseInt($('rTopN').value) || 10,
+    speed_min: $('rSpeedMin').value || '1',
+    enabled: $('rEnabled').checked
+  };
+  try {
+    const r = await fetch('/api/regions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    if (!r.ok) { const e = await r.json(); toast(e.error || '保存失败', true); return; }
+    toast('任务已保存: ' + region + (body.enabled ? '（定时已启用）' : '（定时停用）'));
+    loadRegions();
+  } catch (e) { toast('网络错误', true); }
+}
+
+function editRegion(region) {
+  const t = regionTasks.find(x => x.region === region);
+  if (!t) return;
+  $('rRegion').value = t.region;
+  $('rName').value = t.name;
+  $('rColos').value = t.colos.join(',');
+  $('rCron').value = t.cron;
+  $('rTopN').value = t.top_n;
+  $('rSpeedMin').value = t.speed_min;
+  $('rEnabled').checked = t.enabled;
+  document.querySelector('#regionList').closest('.card').querySelector('details').open = true;
+  $('rRegion').focus();
+}
+
+async function delRegion(region) {
+  if (!confirm(`删除地区任务 ${region}？（已生成的结果文件不受影响）`)) return;
+  try {
+    const r = await fetch('/api/regions/' + encodeURIComponent(region), { method: 'DELETE' });
+    if (!r.ok) { const e = await r.json(); toast(e.error || '删除失败', true); return; }
+    toast('已删除: ' + region);
+    loadRegions();
+  } catch (e) { toast('网络错误', true); }
+}
+
+async function scanRegion(region) {
+  try {
+    const r = await fetch('/api/regions/' + encodeURIComponent(region) + '/scan', { method: 'POST' });
+    if (r.status === 409) { toast('已有扫描任务在运行，请稍候', true); return; }
+    if (!r.ok) { const e = await r.json(); toast(e.error || '触发失败', true); return; }
+    toast('已开始扫描地区: ' + region);
+    poll();
+  } catch (e) { toast('网络错误', true); }
+}
+
 function esc(s) {
   return String(s || '').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
 }
@@ -334,16 +514,18 @@ let lastRunning = false;
 setInterval(async () => {
   try {
     const st = await (await fetch('/api/status')).json();
-    if (lastRunning && !st.running) { loadResults(); loadLogs(); }
+    if (lastRunning && !st.running) { loadResults(); loadLogs(); loadRegions(); }
     lastRunning = st.running;
   } catch (e) {}
 }, 2000);
 setInterval(loadResults, 15000);
+setInterval(loadRegions, 30000);
 
 loadConfig();
 poll();
 loadResults();
 loadLogs();
+loadRegions();
 setInterval(loadLogs, 30000);
 </script>
 </body>
